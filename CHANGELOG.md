@@ -15,6 +15,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   a session (and so the first navigation of an MCP session) failed at 31
   seconds and worked when repeated (#321). The wait now ends when the browser
   answers or when it is gone.
+- **A request's `resource_type` says what it is.** Juggler sends a request's
+  `cause` as an `nsIContentPolicy` constant name (`TYPE_DOCUMENT`,
+  `TYPE_XMLHTTPREQUEST`, `TYPE_FETCH`), and the table it was looked up in was
+  keyed by `document`, `xmlhttprequest`, `fetch`, so nothing matched and every
+  request reported `other`. The lookup now uses the Playwright driver's own
+  table, `internalCause` first so an EventSource reports `eventsource`
+  (#305, by richardpowellus).
 
 ## [0.33.0] - 2026-10-11
 
