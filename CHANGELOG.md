@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.35.2] - 2026-10-12
+
+The pin moves to invisible-core 41.38.0.
+
+### Added
+- **`page.evaluate_read(expression, arg=None)`**, not in Playwright: `evaluate`
+  for a read that has no effect on the page, which the caller declares. When
+  the page navigates under it, it is made again on the page that replaced it
+  and answers from there, where `evaluate` raises. Never pass it code with an
+  effect: it may run in both documents.
+
+### Fixed
+- **The caller's code runs once when its page navigates while it waits.** A
+  script passed to `page.evaluate`, `evaluate_handle` or
+  `eval_on_selector_all` that was waiting on a promise when its page navigated
+  was sent again into the page that replaced it, so a script with an effect
+  ran twice (since 0.35.0). It now raises "Execution context was destroyed,
+  most likely because of a navigation", as Playwright does, and is never sent
+  again. `wait_for_function` keeps polling on the new page. The library's own
+  reads are not the caller's code and still answer with the page that replaced
+  the one they went to: `count`, `inner_text`, `text_content`, and now
+  `all_inner_texts` and `all_text_contents` too, which no longer travel as an
+  `eval_on_selector_all`.
+
 ## [0.35.1] - 2026-10-12
 
 The pin moves to invisible-core 41.37.0.

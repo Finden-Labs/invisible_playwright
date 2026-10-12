@@ -42,7 +42,7 @@ from invisible_core.juggler.actions import Actions
 from invisible_core.juggler.deadline import Deadline
 from .dispatcher import (Dispatcher, ExpectNotMet, ProtocolException,
                          Server)
-from invisible_core.juggler.injected import InjectedScript
+from invisible_core.juggler.injected import ContextDestroyed, InjectedScript
 from invisible_core.juggler.keyboard import MODIFIER_MASK
 from invisible_core.juggler.lifecycle import Lifecycle
 
@@ -693,6 +693,7 @@ class FrameDispatcher(Dispatcher):
         "setContent": "op_set_content",
         "evalOnSelector": "op_eval_on_selector",
         "evalOnSelectorAll": "op_eval_on_selector_all",
+        "readAll": "op_read_all",
         "selectOption": "op_select_option",
         "setInputFiles": "op_set_input_files",
         "tap": "op_tap",
@@ -890,8 +891,13 @@ class FrameDispatcher(Dispatcher):
         Everything else in this file stays in utility on purpose. This one
         method leaves, because the caller asked for it.
         """
+        # ⛔ `repeatable` comes only from the fork's `evaluate_read`, a read
+        # its caller declares free of effects: made again on the page that
+        # replaced the one it went to. Everything else is the caller's code,
+        # sent once ([B285]).
         return {"value": _serialize(self.injected.evaluate_in_main(
-            self.frame_id, _with_argument(params)))}
+            self.frame_id, _with_argument(params),
+            repeatable=params.get("repeatable") is True))}
 
     # ── acting ──────────────────────────────────────────────────────────────
     # ⛔ frame-crossing selectors
@@ -1237,8 +1243,15 @@ class FrameDispatcher(Dispatcher):
         deadline = Deadline(self._timeout(params))
         expression = _with_argument(params)
         while True:
-            value = self.injected.evaluate_in_main(self.frame_id,
-                                                        expression)
+            # ⛔ A NAVIGATION DOES NOT END THE POLL. The predicate is sent once
+            # per turn (the page's world is never sent the caller's code twice,
+            # [B285]), and a world that went under it means the next turn asks
+            # the new document, as Playwright's polling survives a navigation.
+            try:
+                value = self.injected.evaluate_in_main(self.frame_id,
+                                                       expression)
+            except ContextDestroyed:
+                value = None
             if value:
                 # ⛔ A HANDLE, NEVER None. `_frame.py` wraps this reply in
                 # `from_channel(...)`, so answering None is not "no handle" -
@@ -1536,14 +1549,32 @@ class FrameDispatcher(Dispatcher):
         finally:
             self.injected.dispose(frame_id, object_id)
 
+    def op_read_all(self, params: Dict) -> Any:
+        """`locator.all_inner_texts()` and `all_text_contents()`: a read of
+        every match, in one command of values, made again on the page that
+        replaced the one it went to ([B282]). The fork's client asks for them
+        here and not through `evalOnSelectorAll`, which carries the caller's
+        code and sends it once ([B285]); upstream's client sends a fixed
+        function through that door, and nothing on this side can tell it from
+        a caller's."""
+        what = params.get("what")
+        if what not in ("innerText", "textContent"):
+            raise ProtocolException(
+                "readAll reads innerText or textContent, not %r" % what)
+        frame_id, selector = self.enter_frames(params["selector"])
+        return {"value": self.injected.read_all(frame_id, selector, what)}
+
     def op_eval_on_selector_all(self, params: Dict) -> Any:
+        """`page.eval_on_selector_all`: the caller's function, sent ONCE. A
+        frame that navigates under it is `ContextDestroyed`, as Playwright
+        raises; sending it again ran it twice ([B285])."""
         frame_id, selector = self.enter_frames(params["selector"])
         value = self.injected.call(
             frame_id,
             "(injected, sel) => { const els = injected.querySelectorAll("
             "  injected.parseSelector(sel), document); %s }"
             % _called_on(params, "els"),
-            selector)
+            selector, repeatable=False)
         return {"value": _serialize(value)}
 
     def op_evaluate_handle(self, params: Dict) -> Any:
