@@ -6,11 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-## [0.35.11] - 2026-10-16
+## [0.36.0] - 2026-10-16
 
-The pin stays at invisible-core 47.41.0, on the same firefox-47 engine.
+The pin moves to invisible-core 48.41.0, on the firefox-48 engine. 0.35.11 was
+never published: its fix is listed here.
+
+### Added
+- **The branding a page reads is a profile field.** `pin={"branding": ...}`
+  takes `"official"` (the default, the retail Firefox's files), `"unofficial"`,
+  or the absolute path of a zip archive of your own with the same 16 files at
+  its root. The engine serves the declared files at `chrome://branding/content/`
+  and `resource://usercontext-content/branding/` instead of its own, from inside
+  the archive as Firefox serves its own branding. Needs firefox-48.
+
+### Changed
+- **The speechSynthesis voices follow the session's language.** An it-IT session
+  lists the voices of a Windows with Italian added instead of only the American
+  ones; a language without a measured set keeps the English one, and a
+  `hardware.voices` pin still wins.
 
 ### Fixed
+- **A persistent profile stays the same machine across launches.** With
+  `profile_dir` and no `seed`, every launch used to draw a new seed, so the same
+  profile came back with another GPU, screen and fonts. The first launch now
+  records its seed in the profile and later ones reuse it; an explicit `seed`
+  that differs from the recorded one is refused.
 - **Opening and closing pages quickly no longer breaks `new_page()`.** A page's
   close and the delivery of its events ran on two threads with nothing between
   them, so an event of a page being closed could create a response under a
