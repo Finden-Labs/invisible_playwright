@@ -6,6 +6,69 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-10-17
+
+The pin moves to invisible-core 49.44.0, on the firefox-49 engine.
+
+### Changed
+- **Your code runs in a world of its own, where a page that replaced a
+  standard API cannot count your calls.** `evaluate`, `evaluate_handle`,
+  `wait_for_function`, `eval_on_selector(_all)`, `locator.evaluate`,
+  `handle.evaluate` and `set_content` ran in the page's own realm, so a
+  call to `document.querySelector` went through whatever the page had
+  put in its place: a Cloudflare challenge wraps it, and one lookup of
+  its token field from an evaluate got the clearance refused. They now
+  run in a world with the page's principal where a name the standard
+  defines is the native one, and every other name is the page's:
+  `window.__NEXT_DATA__`, a node's `__vue__` and the page's functions
+  answer as before.
+  On what the page created (its classes, their instances, its plain objects)
+  the page's definitions win, `toString` and `valueOf` included, and an
+  object your code hands to the page keeps its identity and looks to the
+  page like its own (`instanceof Array` holds, its `constructor` is the
+  page's). What changes, and it is declared rather than accidental: a name
+  the standard defines for one of the browser's own objects wins even where
+  the page redefined it on that object itself (a setter the page put on one
+  input's `value` does not run; `.wrappedJSObject` gives the page's own
+  view); a bare assignment to an undeclared name creates a global of your
+  world, not of the page (`window.x = 1` still reaches the page); and your
+  code's own `eval` is not governed by the page's Content-Security-Policy,
+  which governs the page's (`window.eval`) as before. Needs firefox-49.
+- **`request.post_data` holds the body with no route as well.** Until
+  firefox-48 the engine read a request's body only while a route was set, so
+  every POST of a page with no route answered `None`, like a form sent empty.
+  It now reads every body up to 10 MB, as Playwright's does, and the upload
+  reaches the site whole. Needs firefox-49.
+- **`response.security_details()` names the certificate, and
+  `response.from_service_worker` says when a service worker answered.**
+  The engine reported neither (`None` and `False` for every response); it now
+  reports both as Playwright's does. Needs firefox-49.
+
+### Fixed
+- **`eval_on_selector`, `eval_on_selector_all`, `locator.evaluate` and
+  `handle.evaluate` see what the page put on an element.** They ran
+  behind the automation's own view, where `el.__vue__` and the methods
+  of a custom element's class do not exist.
+- **The browser's favicon request no longer reaches the client.** A
+  `page.route("**/*")` handler saw `GET /favicon.ico` now and then, as did the
+  `request`, `response` and `requestfinished` listeners, and a
+  `route.fallback(post_data=...)` rewrote it too. As in Playwright, the favicon,
+  and a request it redirects to, now sends no event, reaches no route handler
+  and is not a request `networkidle` waits on. Unlike Playwright it is not
+  aborted under a route: it goes to the site, as from any Firefox.
+- **A request held after interception was switched off no longer stalls the
+  session.** Its release was sent from the thread that delivers the engine's
+  events and waited for a reply only that thread could read; the next command
+  of the page then waited forever.
+- **`route.abort()` with no error code fails the request with
+  `NS_ERROR_FAILURE`, as in Playwright on Firefox.** It failed with
+  `NS_ERROR_ABORT`, the code of `route.abort("aborted")`.
+- **A route that sends a navigation to another URL lands there.**
+  `route.fallback(url=...)` or `route.continue_(url=...)` on a document
+  request made `goto` fail with "reported committed on ..., which is not where
+  it went", and the response kept the URL the request was sent with. The
+  response is now the routed URL's, and `goto` lands on it.
+
 ## [0.36.2] - 2026-10-17
 
 The pin moves to invisible-core 48.43.0, still on the firefox-48 engine.
