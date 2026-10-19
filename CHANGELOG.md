@@ -6,6 +6,76 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-10-19
+
+The pin moves to invisible-core 50.48.0, on the same firefox-50 engine.
+
+### Fixed
+- **`expect()` works for every condition, not two families.** The server
+  re-wrote Playwright's assertions in Python one condition at a time and had
+  written `to_have_count` and the `to_be_*` states; `to_have_text`,
+  `to_contain_text`, `to_have_value`, `to_have_values`, `to_have_attribute`,
+  `to_have_class`, `to_contain_class`, `to_have_css`, `to_have_id`,
+  `to_have_js_property`, `to_be_focused`, `to_be_empty`, `to_be_in_viewport`,
+  `to_have_title`, `to_have_url` and the accessibility ones answered "is not
+  implemented yet". Each reading is now Playwright's own `expect`, from the
+  injected script this package already ships, called the way Playwright's
+  server calls it: strict mode, `element(s) not found`, and a JavaScript error
+  that ends the wait with its message. On Playwright's own suite, its expect
+  tests on firefox-49 went from 30 of 94 passing to 75, with none lost.
+- `to_have_js_property` with an object, an array or a date as the expected
+  value is refused by name: the page's value lives in another realm, and
+  comparing it would always report a difference. Primitives are compared.
+  `to_match_aria_snapshot` is refused by name too: its template is YAML that
+  Playwright's server parses, and this one has no parser for it.
+- A failed `expect` reports an object as the object. The client read the value
+  the server sent twice, the second time as if it were still in its wire form,
+  so `{"a": 1}` failed with `KeyError: 'id'` instead of the assertion's message,
+  and `{"v": "x"}` or `{"n": 5}` were reported as `x` and `5`. The vendored
+  client had the two reads from Playwright 1.61.0, which still has them; the
+  second one is gone.
+- A failed `expect` prints its call log, as Playwright's does: the assertion
+  and its timeout (`Expect "to_be_visible" with timeout 5000ms`), what it
+  waited for (`waiting for locator("#a1")`), and what each reading found
+  (`locator resolved to <input/>`, `unexpected value "Go"`). The message said
+  what was expected and what was seen, and nothing of the wait in between.
+- `page.goto` follows the context's `base_url`. The server never read it, so
+  `goto("/empty.html")` in a context created with a base failed with
+  "Invalid url /empty.html"; it now navigates to the base's `/empty.html`, as
+  Playwright does. The address is resolved by the engine's own URL parser,
+  the one that then navigates to it.
+- `page.evaluate`, `evaluate_handle`, `wait_for_function` and the
+  element-scoped evaluations run the caller's text as a script, as Playwright
+  does. The server put it inside an expression so that it could call the
+  result in the same pass, so a statement with its semicolon,
+  `setTimeout(() => {...}, 2000);`, died with "missing ) in parenthetical".
+  The text is now evaluated on its own and a function it produces is called
+  with the argument, and the page sees the caller's code without anything
+  around it. `wait_for_function` evaluates a function predicate once per
+  document and calls it on every turn, as Playwright's poll does.
+
+### Changed
+- **The user-install job runs on the ledger pull request**, not on
+  `release: published`, which never fired: the Release is created with
+  GITHUB_TOKEN, and an event that token causes starts no other workflow.
+  CI checks the wiring with `python -m invisible_core.install_job`.
+- The release tests keep out of the venvs they build every variable the
+  core's library reads, as `invisible_core.install_job.LEAKS` lists them: an
+  engine folder, a seal file or a GitHub token in the caller's shell no
+  longer changes what they measure.
+- The publish workflow checks the version and the ledger against the index
+  before it uploads (`invisible_core.release check --verify-index`), as the
+  pre-push hook does: a clone without the hook can no longer skip it.
+- **The vendored client's README says what actually differs from upstream.**
+  `_pw/README.md` named `_impl/_driver.py`, a file removed with the Node driver,
+  as the only changed file, while eight files carry the
+  `# MODIFIED by invisible_playwright` marker; it now lists them, in English.
+- **`_pw/` is no longer excluded from the English gate.** The upstream code is
+  English already, so the folder exclusion only hid our own text: the README
+  and the error raised for `chromium` and `webkit`, now in English.
+- `THIRD_PARTY_FORK.md` gives the vendored client's version as 1.61.0, which is
+  what `_pw/_repo_version.py` and the development pin say.
+
 ## [0.39.0] - 2026-10-18
 
 The pin moves to invisible-core 50.47.0, on the firefox-50 engine. From

@@ -41,8 +41,9 @@ from invisible_core.juggler import connection as juggler
 from invisible_core.juggler.actions import Actions
 from invisible_core.juggler.deadline import Deadline
 from .dispatcher import (Dispatcher, ExpectNotMet, ProtocolException,
-                         Server)
-from invisible_core.juggler.injected import ContextDestroyed, InjectedScript
+                         Server, current_call)
+from invisible_core.juggler.injected import (ContextDestroyed, EvaluationError,
+                                             InjectedScript, js_truthy)
 from invisible_core.juggler.keyboard import MODIFIER_MASK
 from invisible_core.juggler.lifecycle import Lifecycle
 
@@ -52,11 +53,11 @@ from invisible_core.juggler.lifecycle import Lifecycle
 # from HERE, and a move that breaks its callers to tidy a file is not a
 # tidy-up. One definition, two names to reach it. (The profile helpers and the
 # `user.js` writer are the core's since 0.30.0, and their tests are there.)
-from ._marshal import (_as_callable, _button, _called_on, _caller_timeout,
+from ._marshal import (_js_number, _as_script, _button, _caller_timeout,
                        _console_text,
-                       _deserialize, _element_function, _guid_of,
+                       _deserialize, _guid_of,
                        _headers_array, _js_string, _location,
-                       _resource_type, _serialize, _with_argument)
+                       _resource_type, _serialize)
 # ⛔ THE PARSER IS THE CORE'S, and briefly it was not: a copy of it lived
 # here for the length of one fix. Two readings of what a proxy is would be
 # the same duplication that produced the defect, one layer down.
@@ -311,6 +312,118 @@ def _remote_value(remote: Dict) -> Any:
     return remote.get("value")
 
 
+#: Calls what the caller's script produced with the receivers, then the
+#: argument: Playwright's utility script calls `result(...args)` on what
+#: `eval` produced.
+_CALL = "(f, ...a) => f(...a)"
+#: Reads a caller's object by value, from the reference that holds it.
+_READ = "o => o"
+#: The receivers of `eval_on_selector_all`: one array, in the caller's world.
+_ARRAY = "(...a) => a"
+
+
+def _call_callers_function(injected: InjectedScript, context: str, function: str,
+                           receivers, params: Dict, *, by_value: bool) -> Dict:
+    """`function(...receivers, arg)` in the caller's world: the argument goes
+    as a protocol value, never into a text."""
+    return injected.call_raw(
+        context, _CALL,
+        [{"objectId": function}] + [{"objectId": r} for r in receivers]
+        + [{"value": _deserialize(params.get("arg"))}],
+        by_value=by_value)
+
+
+class _Predicate:
+    """The caller's `wait_for_function` predicate, turn by turn, as
+    Playwright's poll runs it ([B340]): the script is evaluated once in a
+    world, and when it produced a function, that function is called again on
+    every turn after, with the argument (Playwright keeps it as
+    `evaledExpression`); a script that is not a function is evaluated again on
+    each turn. A world that goes takes the function with it, and the next turn
+    evaluates the script in the new one."""
+
+    def __init__(self, injected: InjectedScript, frame_id: str, params: Dict) -> None:
+        self.injected = injected
+        self.frame_id = frame_id
+        self.params = params
+        #: (context, objectId) of the function, in the world that made it.
+        self.function: Optional[tuple] = None
+
+    def turn(self) -> Optional[Dict]:
+        """The value as a RemoteObject when JavaScript judges it truthy, None
+        when not; a falsy object is released here. `ContextDestroyed` passes
+        through, and any other failure releases the function first."""
+        injected = self.injected
+        context = injected.caller_context(self.frame_id)
+        try:
+            if self.function is None or self.function[0] != context:
+                self.function = None
+                remote = injected.evaluate_raw(
+                    context, _as_script(self.params["expression"]))
+                if remote.get("type") != "function":
+                    return self._judged(context, remote)
+                self.function = (context, remote["objectId"])
+            return self._judged(context, _call_callers_function(
+                injected, context, self.function[1], (), self.params,
+                by_value=False))
+        except ContextDestroyed:
+            self.function = None
+            raise
+        except BaseException:
+            self.release()
+            raise
+
+    def _judged(self, context: str, remote: Dict) -> Optional[Dict]:
+        if js_truthy(remote):
+            return remote
+        if "objectId" in remote:
+            self.injected.release(context, remote["objectId"])
+        return None
+
+    def release(self) -> None:
+        if self.function is not None:
+            context, object_id = self.function
+            self.function = None
+            self.injected.release(context, object_id)
+
+
+def _run_callers_code(injected: InjectedScript, frame_id: str, params: Dict,
+                      receivers=(), *, by_value: bool) -> Dict:
+    """THE ONE PLACE the caller's code runs ([B340]), the way Playwright's
+    utility script runs it: the caller's text is evaluated as a script in the
+    caller's world (`_as_script`), and when what it produced is a function,
+    that function is called with the receivers and the argument. The engine's
+    RemoteObject comes back, by value or by reference.
+
+    ⛔ THE PAGE SEES THE CALLER'S TEXT AND NOTHING ELSE. Until [B340] it was
+    put inside `(() => { const r = (TEXT); return typeof r === 'function' ?
+    r(ARG) : r; })()`, which refused every statement ("missing ) in
+    parenthetical" on `setTimeout(...);`, which Playwright runs) and was this
+    package's own code around the caller's, in a place a page can look at. The
+    call that follows is a protocol call like every other this server makes.
+
+    Sent once ([B285]): a world that goes under it is `ContextDestroyed`. The
+    function's reference is released after its call, and an object read by
+    value after the read, so a call leaves nothing behind in the page.
+    """
+    context = injected.caller_context(frame_id)
+    remote = injected.evaluate_raw(context, _as_script(params["expression"]))
+    if remote.get("type") == "function":
+        try:
+            return _call_callers_function(injected, context, remote["objectId"],
+                                          receivers, params, by_value=by_value)
+        finally:
+            injected.release(context, remote["objectId"])
+    if by_value and "objectId" in remote:
+        try:
+            return injected.call_raw(context, _READ,
+                                     [{"objectId": remote["objectId"]}],
+                                     by_value=True)
+        finally:
+            injected.release(context, remote["objectId"])
+    return remote
+
+
 class ElementHandleDispatcher(Dispatcher):
     TYPE = "ElementHandle"
     METHODS = {
@@ -461,10 +574,11 @@ class ElementHandleDispatcher(Dispatcher):
         driver's `click` carried a `position` and ours did not.
         """
         if self.world == "caller":
-            return {"value": _serialize(_remote_value(self._in_caller(
-                _element_function(params), by_value=True)))}
+            return {"value": _serialize(_remote_value(_run_callers_code(
+                self.injected, self.frame.frame_id, params, [self.object_id],
+                by_value=True)))}
         return {"value": _serialize(self.frame._call_on_elements(
-            self.frame.frame_id, [self.object_id], _element_function(params)))}
+            self.frame.frame_id, [self.object_id], params))}
 
     def op_text_content(self, params: Dict) -> Any:
         return {"value": self.injected.text_content(
@@ -806,9 +920,31 @@ class FrameDispatcher(Dispatcher):
 
 
     # ── navigation ──────────────────────────────────────────────────────────
+    def _navigation_url(self, url: str) -> str:
+        """The address `goto` navigates to: `url` resolved against the
+        context's `baseURL`, as Playwright's server does in `goto`
+        (`new URL(given, base).toString()`, and the given text as it is when
+        that throws). Until [B342] `baseURL` was read nowhere in this server,
+        so `goto("/empty.html")` with a base failed with "Invalid url".
+
+        ⛔ RESOLVED BY THE ENGINE'S OWN URL PARSER, in the utility world, not
+        with `urllib.parse.urljoin`: the URL standard and Python's RFC 3986
+        join disagree at the edges (dot segments, special schemes,
+        percent-encoding, hosts), and the address resolved here is the one the
+        engine then navigates to, so one parser does both. It costs one
+        evaluation, and only when the context has a base."""
+        base = self.page.context.options.get("baseURL")
+        if not base:
+            return url
+        return self.injected.call(
+            self.frame_id,
+            "(injected, given, base) => { try { return new URL(given, base).toString(); }"
+            " catch (e) { return given; } }",
+            url, base)
+
     def op_goto(self, params: Dict) -> Any:
         result = self.lifecycle.goto(
-            params["url"], frame_id=self.frame_id,
+            self._navigation_url(params["url"]), frame_id=self.frame_id,
             until=params.get("waitUntil") or "load",
             timeout=self._timeout(params))
         # Navigation events come from the engine, not a snapshot taken when
@@ -954,9 +1090,13 @@ class FrameDispatcher(Dispatcher):
         # its caller declares free of effects: made again on the page that
         # replaced the one it went to. Everything else is the caller's code,
         # sent once ([B285]).
-        return {"value": _serialize(self.injected.evaluate_in_caller(
-            self.frame_id, _with_argument(params),
-            repeatable=params.get("repeatable") is True))}
+        def attempt(deadline=None):
+            return _remote_value(_run_callers_code(
+                self.injected, self.frame_id, params, by_value=True))
+        if params.get("repeatable") is True:
+            return {"value": _serialize(self.injected.in_current_world(
+                attempt, timeout=30.0))}
+        return {"value": _serialize(attempt())}
 
     # ── acting ──────────────────────────────────────────────────────────────
     # ⛔ frame-crossing selectors
@@ -1279,10 +1419,12 @@ class FrameDispatcher(Dispatcher):
         return {"element": handle.channel}
 
     def _call_on_elements(self, frame_id: str, elements: List[str],
-                          declaration: str) -> Any:
-        """The caller's `declaration(injected, ...elements)` in the caller's
-        world, on elements this server holds in the utility world. THE ONE
-        PLACE element-scoped caller code runs [B322].
+                          params: Dict, *, as_array: bool = False) -> Any:
+        """The caller's code on elements this server holds in the utility
+        world, run in the caller's world by `_run_callers_code` with the
+        elements as its receivers, or as ONE array of them (`as_array`, for
+        `eval_on_selector_all`). THE ONE PLACE element-scoped caller code
+        runs [B322].
 
         `handle.evaluate`, `eval_on_selector` and `eval_on_selector_all` run
         the caller's code as much as `evaluate` does, so they run where it
@@ -1292,21 +1434,28 @@ class FrameDispatcher(Dispatcher):
         them as the page. The elements cross with `Page.adoptNode` (the same
         node, in the other world) and the copies are released after the call.
         The caller's code is sent once ([B285]); finding the elements is this
-        package's read, made before it. `injected` is null there: the caller's
-        code never sees this package's script."""
+        package's read, made before it. The caller's code never sees this
+        package's script."""
         context = self.injected.caller_context(frame_id)
         adopted: List[str] = []
+        array: Optional[str] = None
         try:
             for element in elements:
                 copy = self.injected.node_to_caller(frame_id, element)
                 if not copy:
                     raise ProtocolException("Element is not attached to the DOM")
                 adopted.append(copy)
-            return _remote_value(self.injected.call_raw(
-                context, declaration,
-                [{"value": None}] + [{"objectId": a} for a in adopted],
-                by_value=True))
+            receivers = adopted
+            if as_array:
+                array = self.injected.call_raw(
+                    context, _ARRAY, [{"objectId": a} for a in adopted],
+                    by_value=False)["objectId"]
+                receivers = [array]
+            return _remote_value(_run_callers_code(
+                self.injected, frame_id, params, receivers, by_value=True))
         finally:
+            if array:
+                self.injected.release(context, array)
             for copy in adopted:
                 self.injected.release(context, copy)
 
@@ -1355,24 +1504,26 @@ class FrameDispatcher(Dispatcher):
         stays coarse.
         """
         deadline = Deadline(self._timeout(params))
-        expression = _with_argument(params)
+        expression = params["expression"]
+        predicate = _Predicate(self.injected, self.frame_id, params)
         while True:
-            # ⛔ A NAVIGATION DOES NOT END THE POLL. The predicate is sent once
-            # per turn (the caller's code is never sent twice,
-            # [B285]), and a world that went under it means the next turn asks
-            # the new document, as Playwright's polling survives a navigation.
+            # ⛔ A NAVIGATION DOES NOT END THE POLL. Each turn is one command
+            # (the caller's code is never sent twice, [B285]), and a world that
+            # went under it means the next turn evaluates the script in the new
+            # document, as Playwright's polling survives a navigation.
             # ⛔ TRUTHY AS JAVASCRIPT JUDGES IT, from ONE run by reference
-            # (`poll_in_caller`, [B323]). This used to run the predicate by value
+            # (`_Predicate.turn`, [B323]). This used to run the predicate by value
             # and let Python judge the serialized result, so a predicate that
             # returns a node - `() => document.querySelector('#x')`, the most
             # common wait there is - never ended: a node serializes to nothing
             # truthy. A truthy value now IS the handle, and the caller's code
             # no longer runs a second time to get one.
             try:
-                remote = self.injected.poll_in_caller(self.frame_id, expression)
+                remote = predicate.turn()
             except ContextDestroyed:
                 remote = None
             if remote is not None:
+                predicate.release()
                 # ⛔ A HANDLE, NEVER None. `_frame.py` wraps this reply in
                 # `from_channel(...)`, so answering None is not "no handle" -
                 # it is `AttributeError: 'NoneType' object has no attribute
@@ -1380,6 +1531,7 @@ class FrameDispatcher(Dispatcher):
                 # succeeded. It stayed hidden while the poll timed out first.
                 return {"handle": self._handle_from_caller(remote).channel}
             if deadline.passed():
+                predicate.release()
                 # A TimeoutError, which the client receives as Playwright's,
                 # as upstream raises for this wait (until 0.34.0 a plain Error).
                 raise TimeoutError(
@@ -1400,70 +1552,173 @@ class FrameDispatcher(Dispatcher):
         `to_be_*` and `to_have_count` failed, whatever the page held
         (2026-10-12). Polling is the server's, and so is the verdict:
         `isNot` inverts it, and a condition that never held is
-        `ExpectNotMet` with the last value seen."""
+        `ExpectNotMet` with the last value seen.
+
+        ⛔ AND WHAT IS POLLED IS PLAYWRIGHT'S OWN READING ([B328]). Until 0.38
+        this file re-wrote the conditions one by one, in Python, and had
+        written two families: `to.have.count` and the `to.be.*` states.
+        Everything else - `to_have_text`, `to_have_value`, `to_have_attribute`,
+        `to_have_class`, `to_be_in_viewport`, `to_have_title`, `to_have_url`,
+        `to_be_focused`, `to_be_empty`, `to_have_js_property`, `to_have_values`
+        and the rest - answered "is not implemented yet", and Playwright's own
+        suite was red on every one of them. The injected script this package
+        already ships carries Playwright's `expect`, every condition of it, so
+        the reading is that one function, called the way Playwright's server
+        calls it (`_expectInternal` in `frames.ts`), and there is no second
+        definition to fall behind. What stays here is what is the server's
+        there too: the polling, the strict check, and the verdict.
+
+        A JavaScript error in the reading - a strict-mode violation, a
+        `to_have_values` on something that is not a multiple select - ends the
+        wait at once and travels as the message, as upstream: it is not a
+        condition that a later page could make hold.
+        """
         expression = params.get("expression") or ""
         selector = params.get("selector")
         is_not = bool(params.get("isNot"))
         deadline = Deadline(self._timeout(params))
+        last: Optional[Dict] = None
+        # ⛔ THE CALL LOG, line for line where Playwright writes it ([B341]):
+        # the title and the timeout (its dispatcher), what is waited for
+        # (`frames.ts` `expect`), and each reading (`_expectInternal`). Until
+        # [B341] a failed expect said what was expected and what was seen, and
+        # nothing of the wait in between.
+        call = current_call()
+        call.log("%s%s" % (call.title, " with timeout %sms" % _js_number(params["timeout"])
+                           if params.get("timeout") else ""))
+        if selector:
+            call.log("waiting for " + self.injected.call(
+                self.frame_id,
+                "(injected, sel) => injected.utils.asLocator(injected._sdkLanguage, sel)",
+                selector))
         while True:
-            matches, received = self._expect_probe(expression, selector, params)
-            if matches != is_not:
-                return None
+            try:
+                reading = self._expect_probe(expression, selector, params)
+            except ContextDestroyed:
+                # A navigation under the reading: the next turn asks the new
+                # document, as Playwright's polling survives one.
+                reading = None
+            except EvaluationError as e:
+                message = str(e).split("\n", 1)[0]
+                if message.startswith("Error: "):
+                    message = message[len("Error: "):]
+                raise ExpectNotMet(message, {"customErrorMessage": message},
+                                   call.lines)
+            if reading is not None:
+                for line in (reading.get("log"), reading.get("unexpected")):
+                    if line:
+                        call.log(line)
+                if reading["matches"] != is_not:
+                    return None
+                last = reading
             if deadline.passed():
+                details: Dict[str, Any] = {"timedOut": True}
+                if last is not None:
+                    received: Dict[str, Any] = {}
+                    if "received" in last:
+                        received["value"] = _serialize(last["received"])
+                    if last.get("ariaSnapshot") is not None:
+                        received["ariaSnapshot"] = last["ariaSnapshot"]
+                    if received:
+                        details["received"] = received
+                    if last.get("missingReceived"):
+                        details["customErrorMessage"] = "element(s) not found"
                 raise ExpectNotMet(
                     "expect(%s%s) did not hold within %dms"
                     % ("not " if is_not else "", expression,
                        round(deadline.seconds * 1000)),
-                    {"received": {"value": _serialize(received)},
-                     "timedOut": True})
+                    details, call.lines)
             time.sleep(deadline.slice(0.1))
 
+    #: What Playwright's server hands the injected `expect` of the caller's
+    #: options. `expectedValue` is added parsed, as its dispatcher does.
+    _EXPECT_OPTIONS = ("expression", "expressionArg", "expectedText",
+                       "expectedNumber", "useInnerText", "isNot", "selector")
+
+    #: One reading, as `_expectInternal` makes it: every element the selector
+    #: matches, refused when a single-element condition matches more than one,
+    #: and the first match handed to the injected script's `expect`.
+    #: ⛔ `to.have.property` reads THE PAGE'S property: upstream sends that one
+    #: condition to the main world, where the page's own expandos live. From
+    #: this world the same object is `wrappedJSObject`, the page's view of the
+    #: node, and every other condition stays on the native one.
+    _EXPECT = (
+        "async (injected, sel, options) => {"
+        "  let elements = [];"
+        "  let log = '';"
+        "  if (sel !== null) {"
+        "    const parsed = injected.parseSelector(sel);"
+        "    elements = injected.querySelectorAll(parsed, document);"
+        "    const isArray = options.expression === 'to.have.count'"
+        "        || options.expression.endsWith('.array');"
+        "    if (isArray)"
+        "      log = `  locator resolved to ${elements.length} element${elements.length === 1 ? '' : 's'}`;"
+        "    else if (elements.length > 1)"
+        "      throw injected.strictModeViolationError(parsed, elements);"
+        "    else if (elements.length)"
+        "      log = `  locator resolved to ${injected.previewNode(elements[0])}`;"
+        "  }"
+        "  let element = elements[0];"
+        "  if (options.expression === 'to.have.property' && element"
+        "      && element.wrappedJSObject)"
+        "    element = element.wrappedJSObject;"
+        "  const r = await injected.expect(element, options, elements);"
+        "  const out = { matches: !!r.matches,"
+        "                missingReceived: !!r.missingReceived, log };"
+        "  const value = r.received ? r.received.value : undefined;"
+        "  if (!!r.matches === !!options.isNot && !r.missingReceived"
+        "      && !Array.isArray(value))"
+        "    out.unexpected = `  unexpected value \"${value}\"`;"
+        "  if (r.received) {"
+        "    out.received = r.received.value === undefined ? null : r.received.value;"
+        "    if (r.received.ariaSnapshot !== undefined)"
+        "      out.ariaSnapshot = r.received.ariaSnapshot;"
+        "  }"
+        "  return out; }")
+
+    @staticmethod
+    def _structured(argument: Any) -> bool:
+        """Whether Playwright's serialized argument is an object, an array, a
+        date, a regular expression, a URL, an error, a typed array or a handle:
+        anything that is not a primitive."""
+        value = argument.get("value") if isinstance(argument, dict) else None
+        return isinstance(value, dict) and any(
+            tag in value for tag in ("o", "a", "d", "r", "u", "e", "ta", "h"))
+
     def _expect_probe(self, expression: str, selector: Optional[str],
-                      params: Dict) -> tuple:
+                      params: Dict) -> Dict:
         """One reading of an expect condition, on the page as it is NOW:
-        `(matches, received)`."""
-        if selector and expression == "to.have.count":
-            frame_id, sel = self.enter_frames(selector)
-            count = self.injected.count(frame_id, sel)
-            return count == params.get("expectedNumber"), count
-        if selector and expression.startswith("to.be."):
-            return self._expect_state(expression[len("to.be."):], selector,
-                                      params)
-        raise ProtocolException(
-            "expect(%r) is not implemented yet" % expression)
+        `{matches, received?, ariaSnapshot?, missingReceived}`.
 
-    def _expect_state(self, name: str, selector: str, params: Dict) -> tuple:
-        """`to.be.<name>` on the element as it is now: `(matches, received)`.
-
-        ⛔ UNTIL 0.34.1 THE STATE WAS READ INTO A VARIABLE NOBODY USED, and any
-        element that existed matched: `to_be_checked()` on an empty box,
-        `to_be_visible()` on a hidden element. Each state is now the
-        element's, read with the match in one command (`read_match`), and a
-        missing element is hidden and nothing else, as in Playwright."""
-        frame_id, sel = self.enter_frames(selector)
-        if name in ("attached", "detached"):
-            found = self.injected.count(frame_id, sel) > 0
-            return found == (name == "attached"), found
-        if name == "checked":
-            wanted = _deserialize(params.get("expectedValue")) or {}
-            if wanted.get("indeterminate"):
-                state = "indeterminate"
-            else:
-                state = ("unchecked" if wanted.get("checked") is False
-                         else "checked")
-            invert = False
-        elif name == "readonly":
-            state, invert = "editable", True
-        elif name in ("visible", "hidden", "enabled", "disabled", "editable"):
-            state, invert = name, False
-        else:
+        ⛔ `to.match.aria` IS REFUSED BY NAME: its template is YAML that
+        Playwright's server parses into a tree before the injected script sees
+        it, and this server has no parser for it. Saying so is the honest
+        answer; matching an unparsed string would be a verdict on nothing."""
+        if expression == "to.match.aria":
             raise ProtocolException(
-                "expect(%r) is not implemented yet" % ("to.be." + name))
-        found, value = self.injected.read_match(frame_id, sel, "state", state,
-                                                strict=True)
-        if not found:
-            return state == "hidden", None
-        return bool(value) != invert, bool(value)
+                "expect('to.match.aria') is not implemented yet: the template is "
+                "YAML that Playwright's server parses, and this one has no parser "
+                "for it")
+        if expression == "to.have.property" and self._structured(params.get("expectedValue")):
+            # ⛔ A FALSE "DIFFERENT" IS WORSE THAN A REFUSAL. Upstream compares in
+            # the page's own realm; here the page's value is read from the
+            # utility world, and Playwright's `deepEquals` refuses two objects
+            # whose constructors are not the same one, which across realms they
+            # never are. A primitive compares by value and is answered.
+            raise ProtocolException(
+                "expect('to.have.property') with an object, an array or a date "
+                "as the expected value is not implemented yet: the page's value "
+                "lives in another realm, and comparing it would always say it "
+                "differs. A primitive value is compared.")
+        if selector:
+            frame_id, sel = self.enter_frames(selector)
+        else:
+            frame_id, sel = self.frame_id, None
+        options = {k: params[k] for k in self._EXPECT_OPTIONS if k in params}
+        if params.get("expectedValue") is not None:
+            options["expectedValue"] = _deserialize(params["expectedValue"])
+        return self.injected.call(frame_id, self._EXPECT, sel, options) or {
+            "matches": False, "missingReceived": True}
 
     def op_aria_snapshot(self, params: Dict) -> Any:
         """The accessibility tree, as the injected script builds it.
@@ -1661,7 +1916,7 @@ class FrameDispatcher(Dispatcher):
                 "failed to find element matching selector %r" % selector)
         try:
             return {"value": _serialize(self._call_on_elements(
-                frame_id, [object_id], _element_function(params)))}
+                frame_id, [object_id], params))}
         finally:
             self.injected.dispose(frame_id, object_id)
 
@@ -1688,15 +1943,14 @@ class FrameDispatcher(Dispatcher):
         ids = self.injected.query_selector_all(frame_id, selector)
         try:
             return {"value": _serialize(self._call_on_elements(
-                frame_id, ids,
-                "(injected, ...els) => { %s }" % _called_on(params, "els")))}
+                frame_id, ids, params, as_array=True))}
         finally:
             for object_id in ids:
                 self.injected.dispose(frame_id, object_id)
 
     def op_evaluate_handle(self, params: Dict) -> Any:
-        remote = self.injected.evaluate_in_caller_remote(
-            self.frame_id, _with_argument(params))
+        remote = _run_callers_code(self.injected, self.frame_id, params,
+                                   by_value=False)
         return {"handle": self._handle_from_caller(remote).channel}
 
 
