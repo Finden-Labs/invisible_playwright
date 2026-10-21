@@ -60,7 +60,7 @@ _REQUIRED_PREFS_KEYS = (
     "zoom.stealth.webgl.renderer",
     "zoom.stealth.webgl.vendor",
     "webgl.msaa-samples",
-    "zoom.stealth.canvas.noise_skip_mask",
+    "zoom.stealth.canvas.edge_tolerance",
     # baseline sanity
     "privacy.resistFingerprinting",
     "media.peerconnection.enabled",
