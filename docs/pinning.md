@@ -181,6 +181,7 @@ would be the signal. They are pinnable for A/B work, not for realism.
 | `font.cleartype_rendering_mode` | int | `5` | DirectWrite rendering mode. |
 | `font.freetype_gamma` | int | `220` | The FreeType equivalent of `cleartype_gamma`, x100. Declared so the Linux build rasterises with Windows' curve instead of Skia's linear default. |
 | `font.freetype_contrast` | int | `100` | The FreeType equivalent of `cleartype_contrast`, x100. |
+| `font.system_text_quality` | int | `5` | The text quality the engine would otherwise ask the host for: `0` none, `4` standard antialiasing, `5` ClearType. It decides whether the ClearType parameters above apply at all, so on a machine with ClearType off (an RDP session, a VM, a Server) the same binary would draw different text from the same declaration. Declared, never asked of the machine. Any other value is refused. |
 
 ### `desktop.*`
 

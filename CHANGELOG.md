@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-10-21
+
+The pin moves to invisible-core 51.48.0, which brings the firefox-51 engine.
+
+### Changed
+- invisible-core 50.48.0 -> 51.48.0, sealed to the firefox-51 engine (Firefox
+  151.0). The canvas noise now spares two-colour blends (`edge_tolerance`
+  replaces `edge_step` in the core).
+
+### Added
+- `font.system_text_quality` is documented on the pinning page. It was already
+  pinnable (0 none, 4 standard antialiasing, 5 ClearType; default 5) and
+  documented nowhere.
+
 ## [0.40.0] - 2026-10-19
 
 The pin moves to invisible-core 50.48.0, on the same firefox-50 engine.
