@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-10-24
+
+The pin moves to invisible-core 52.48.0, which brings the firefox-52 engine.
+
+### Changed
+- invisible-core 51.48.0 -> 52.48.0, sealed to the firefox-52 engine (Firefox
+  151.0). A 2D canvas, on the page or offscreen, now reads back exactly as it
+  was drawn, as on retail Firefox: the canvas noise is applied to WebGL and
+  WebGPU readback only, which is unchanged.
+- A `toDataURL`/`toBlob` PNG carries the per-session `deBG` chunk retail
+  Firefox 151 writes after IDAT; the pixels are untouched.
+- 1920x1080 panels are drawn at 125% and 150% as often as the Windows fleet
+  is, so more seeds report a display scale above 1 (core).
+- ClearType gamma and contrast are a declared persona field. Every seed keeps
+  the untuned machine's values today.
+
+### Tests
+- e2e: a 2D canvas reads back as drawn on a page canvas and on an
+  OffscreenCanvas, and screenshots follow the persona's display scale.
+
 ## [0.41.0] - 2026-10-21
 
 The pin moves to invisible-core 51.48.0, which brings the firefox-51 engine.
